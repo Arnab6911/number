@@ -24,36 +24,76 @@ def load_my_model():
 model = load_my_model()
 
 # -------------------------------------------------
-# 3. HELPER FUNCTION TO PROCESS THE IMAGE
+# 3. ADVANCED IMAGE PROCESSING FUNCTION
 # -------------------------------------------------
-# We create this function so both tabs can use the same logic
 def process_and_predict(image_file):
     # 1. Load the image
     image = Image.open(image_file)
     # Convert from PIL to a NumPy array (OpenCV format)
     img_array = np.array(image)
-    # Ensure it's in BGR format if it's color (OpenCV default)
+    
+    # 2. --- NEW OPENCV PREPROCESSING ---
+    # Convert to color (OpenCV expects BGR)
     if img_array.ndim == 3:
-        img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-    
-    # Show the image you uploaded/took
-    st.image(image, caption="Your Image", width=300)
-    
-    # 2. Start prediction automatically
-    with st.spinner("🧠 Thinking..."):
-        
-        # 3. Pre-process the image
-        # (This is the *exact* same way we processed the training data)
-        roi_resized = cv2.resize(img_array, (32, 32))
-        roi_normalized = roi_resized.astype('float32') / 255.0
-        roi_batch = np.expand_dims(roi_normalized, axis=0)
+        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+    else:
+        # If it's grayscale, convert it to BGR
+        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
 
-        # 4. Make the prediction
-        prediction = model.predict(roi_batch)
+    # Convert to grayscale for processing
+    img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    
+    # Apply a blur to reduce noise, then use Otsu's thresholding
+    # This creates a clean black-and-white image of the digit
+    blurred = cv2.GaussianBlur(img_gray, (5, 5), 0)
+    _, img_thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Find contours (the outlines of the white shapes)
+    contours, _ = cv2.findContours(img_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        st.error("I couldn't find a digit. Please try a clearer photo with better contrast.")
+        return
+
+    # Find the largest contour, which we assume is our digit
+    largest_contour = max(contours, key=cv2.contourArea)
+    
+    # Get the "bounding box" (x, y, width, height) of the digit
+    x, y, w, h = cv2.boundingRect(largest_contour)
+    
+    # 3. --- CROP THE DIGIT ---
+    # Crop the *original color image* using the box we found
+    # We add a 10-pixel "padding" to make sure we get the whole digit
+    padding = 10
+    roi_x1 = max(0, x - padding)
+    roi_y1 = max(0, y - padding)
+    roi_x2 = min(img_bgr.shape[1], x + w + padding)
+    roi_y2 = min(img_bgr.shape[0], y + h + padding)
+    
+    cropped_digit = img_bgr[roi_y1:roi_y2, roi_x1:roi_x2]
+    
+    if cropped_digit.size == 0:
+        st.error("I found something, but the crop failed. Please try again.")
+        return
+
+    # 4. --- PREPARE FOR MODEL ---
+    # Now we just resize our *perfect crop* to 32x32
+    final_image = cv2.resize(cropped_digit, (32, 32))
+    
+    # Show the user what the model is "seeing"
+    st.image(final_image, caption="What the Model Sees (32x32 Processed)", width=150)
+    
+    # Normalize and add batch dimension
+    img_normalized = final_image.astype('float32') / 255.0
+    img_batch = np.expand_dims(img_normalized, axis=0)
+
+    # 5. --- PREDICT ---
+    with st.spinner("🧠 Thinking..."):
+        prediction = model.predict(img_batch)
         predicted_digit = np.argmax(prediction[0])
         confidence = np.max(prediction[0]) * 100
 
-        # 5. Show the result!
+        # 6. Show the result!
         st.success(f"## I see the digit: {predicted_digit}")
         st.write(f"Confidence: {confidence:.2f}%")
 
@@ -61,9 +101,9 @@ def process_and_predict(image_file):
 # -------------------------------------------------
 # 4. DISPLAY THE APP UI
 # -------------------------------------------------
-st.title("🚀 SVHN Digit Recognizer")
-st.write("This app uses your **SVHN (Photograph Expert) CNN model**.")
-st.write("Upload a photo or take a new one with your camera.")
+st.title("🚀 SVHN Smart Digit Recognizer")
+st.write("This app now uses **OpenCV** to find the digit in your photo *before* predicting.")
+st.info("**Tip:** For best results, use a clear photo with good contrast (e.g., dark number on a light background).")
 
 # Create the two tabs
 tab1, tab2 = st.tabs(["📁 Upload a Photo", "📸 Take a Photo"])
@@ -74,7 +114,6 @@ with tab1:
     uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"], key="uploader")
     
     if uploaded_file is not None:
-        # Call our helper function
         process_and_predict(uploaded_file)
 
 # --- Tab 2: Camera Input ---
@@ -83,5 +122,4 @@ with tab2:
     camera_photo = st.camera_input("Take a picture of a single digit", key="camera")
     
     if camera_photo is not None:
-        # Call our helper function
         process_and_predict(camera_photo)
