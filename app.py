@@ -2,18 +2,16 @@ import streamlit as st
 import tensorflow as tf
 import numpy as np
 import cv2
-from PIL import Image
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
 
 # -------------------------------------------------
 # 1. SET UP THE APP INTERFACE
 # -------------------------------------------------
-# THIS MUST BE THE FIRST STREAMLIT COMMAND
 st.set_page_config(layout="wide")
 
 # -------------------------------------------------
 # 2. LOAD THE "BRAIN"
 # -------------------------------------------------
-# Use st.cache_resource to load the model only once
 @st.cache_resource
 def load_my_model():
     print("--- Loading model... ---")
@@ -24,102 +22,106 @@ def load_my_model():
 model = load_my_model()
 
 # -------------------------------------------------
-# 3. ADVANCED IMAGE PROCESSING FUNCTION
+# 3. HELPER FUNCTION: "LETTERBOXING"
 # -------------------------------------------------
-def process_and_predict(image_file):
-    # 1. Load the image
-    image = Image.open(image_file)
-    # Convert from PIL to a NumPy array (OpenCV format)
-    img_array = np.array(image)
-    
-    # 2. --- NEW OPENCV PREPROCESSING ---
-    # Convert to color (OpenCV expects BGR)
-    if img_array.ndim == 3:
-        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-    else:
-        # If it's grayscale, convert it to BGR
-        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
+# This is the fix for "squizzing".
+# It resizes an image while preserving its aspect ratio by adding black bars.
+def letterbox_image(image, target_size=(32, 32)):
+    # Get image size
+    img_h, img_w, _ = image.shape
+    target_h, target_w = target_size
 
-    # Convert to grayscale for processing
-    img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    
-    # Apply a blur to reduce noise, then use Otsu's thresholding
-    # This creates a clean black-and-white image of the digit
-    blurred = cv2.GaussianBlur(img_gray, (5, 5), 0)
-    _, img_thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # Calculate scale
+    scale = min(target_w / img_w, target_h / img_h)
 
-    # Find contours (the outlines of the white shapes)
-    contours, _ = cv2.findContours(img_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if not contours:
-        st.error("I couldn't find a digit. Please try a clearer photo with better contrast.")
-        return
+    # New (scaled) dimensions
+    new_w = int(img_w * scale)
+    new_h = int(img_h * scale)
 
-    # Find the largest contour, which we assume is our digit
-    largest_contour = max(contours, key=cv2.contourArea)
-    
-    # Get the "bounding box" (x, y, width, height) of the digit
-    x, y, w, h = cv2.boundingRect(largest_contour)
-    
-    # 3. --- CROP THE DIGIT ---
-    # Crop the *original color image* using the box we found
-    # We add a 10-pixel "padding" to make sure we get the whole digit
-    padding = 10
-    roi_x1 = max(0, x - padding)
-    roi_y1 = max(0, y - padding)
-    roi_x2 = min(img_bgr.shape[1], x + w + padding)
-    roi_y2 = min(img_bgr.shape[0], y + h + padding)
-    
-    cropped_digit = img_bgr[roi_y1:roi_y2, roi_x1:roi_x2]
-    
-    if cropped_digit.size == 0:
-        st.error("I found something, but the crop failed. Please try again.")
-        return
+    # Resize image with aspect ratio preservation
+    resized_img = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    # 4. --- PREPARE FOR MODEL ---
-    # Now we just resize our *perfect crop* to 32x32
-    final_image = cv2.resize(cropped_digit, (32, 32))
-    
-    # Show the user what the model is "seeing"
-    st.image(final_image, caption="What the Model Sees (32x32 Processed)", width=150)
-    
-    # Normalize and add batch dimension
-    img_normalized = final_image.astype('float32') / 255.0
-    img_batch = np.expand_dims(img_normalized, axis=0)
+    # Create a new black "canvas"
+    canvas = np.full((target_h, target_w, 3), 0, dtype=np.uint8)
 
-    # 5. --- PREDICT ---
-    with st.spinner("🧠 Thinking..."):
-        prediction = model.predict(img_batch)
-        predicted_digit = np.argmax(prediction[0])
-        confidence = np.max(prediction[0]) * 100
+    # Calculate top-left corner to paste the resized image in the center
+    x_center = (target_w - new_w) // 2
+    y_center = (target_h - new_h) // 2
 
-        # 6. Show the result!
-        st.success(f"## I see the digit: {predicted_digit}")
-        st.write(f"Confidence: {confidence:.2f}%")
+    # Paste the resized image onto the canvas
+    canvas[y_center : y_center + new_h, x_center : x_center + new_w] = resized_img
 
+    return canvas
 
 # -------------------------------------------------
-# 4. DISPLAY THE APP UI
+# 4. THE LIVE VIDEO PROCESSOR
 # -------------------------------------------------
-st.title("🚀 SVHN Smart Digit Recognizer")
-st.write("This app now uses **OpenCV** to find the digit in your photo *before* predicting.")
-st.info("**Tip:** For best results, use a clear photo with good contrast (e.g., dark number on a light background).")
+class SVHNVideoTransformer(VideoTransformerBase):
+    def __init__(self):
+        # Define the Region of Interest (ROI) box
+        self.box_size = 200 # A 200x200 box
+        self.box_color = (0, 255, 0) # Green
+        self.box_thickness = 2
+        self.font = cv2.FONT_HERSHEY_SIMPLEX
 
-# Create the two tabs
-tab1, tab2 = st.tabs(["📁 Upload a Photo", "📸 Take a Photo"])
+    def recv(self, frame):
+        # Convert the video frame to a NumPy array
+        img = frame.to_ndarray(format="bgr24")
+        
+        # Get frame dimensions
+        h, w, _ = img.shape
+        
+        # Calculate top-left corner of the centered box
+        x1 = (w - self.box_size) // 2
+        y1 = (h - self.box_size) // 2
+        # Calculate bottom-right corner
+        x2 = x1 + self.box_size
+        y2 = y1 + self.box_size
 
-# --- Tab 1: File Uploader ---
-with tab1:
-    st.header("Upload from your files")
-    uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"], key="uploader")
-    
-    if uploaded_file is not None:
-        process_and_predict(uploaded_file)
+        # --- PREDICTION LOGIC ---
+        try:
+            # 1. CROP the image to the box
+            roi = img[y1:y2, x1:x2]
+            
+            # 2. Pre-process the ROI
+            #    THIS IS THE NEW, CORRECT WAY (no squizzing!)
+            processed_roi = letterbox_image(roi, (32, 32))
+            
+            # 3. Normalize and add batch dimension
+            roi_normalized = processed_roi.astype('float32') / 255.0
+            roi_batch = np.expand_dims(roi_normalized, axis=0)
+            
+            # 4. Make the prediction
+            prediction = model.predict(roi_batch, verbose=0)
+            
+            # 5. Get the result
+            predicted_digit = np.argmax(prediction[0])
+            confidence = np.max(prediction[0]) * 100
+            
+            # 6. Display the result on the frame
+            text = f"Prediction: {predicted_digit} ({confidence:.1f}%)"
+            cv2.putText(img, text, (x1, y1 - 10), self.font, 0.7, self.box_color, 2)
+            
+        except Exception as e:
+            # If we fail (e.g., at the very start), just skip
+            pass
+        
+        # Draw the ROI box on the image
+        cv2.rectangle(img, (x1, y1), (x2, y2), self.box_color, self.box_thickness)
+        
+        # Return the processed frame
+        return frame.from_ndarray(img, format="bgr24")
 
-# --- Tab 2: Camera Input ---
-with tab2:
-    st.header("Use your camera")
-    camera_photo = st.camera_input("Take a picture of a single digit", key="camera")
-    
-    if camera_photo is not None:
-        process_and_predict(camera_photo)
+# -------------------------------------------------
+# 5. SET UP THE STREAMLIT APP UI
+# -------------------------------------------------
+st.title("🚀 SVHN Live Digit Detector")
+st.info("Center a single digit (e.g., on your phone or paper) inside the green box.")
+
+# Start the webcam feed and apply our video processor
+webrtc_streamer(
+    key="svhn-detector",
+    video_transformer_factory=SVHNVideoTransformer,
+    media_streaming_constraints={"video": True, "audio": False},
+    async_processing=True,
+)
