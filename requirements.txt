@@ -2,4 +2,3 @@ streamlit
 tensorflow-cpu
 opencv-python-headless
 numpy
-streamlit-webrtc
