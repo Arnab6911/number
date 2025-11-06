@@ -122,6 +122,6 @@ st.info("Center a single digit (e.g., on your phone or paper) inside the green b
 webrtc_streamer(
     key="svhn-detector",
     video_transformer_factory=SVHNVideoTransformer,
-    media_streaming_constraints={"video": True, "audio": False},
+    media_stream_constraints={"video": True, "audio": False}, # <--- THIS IS THE FIX
     async_processing=True,
 )
